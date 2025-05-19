@@ -110,13 +110,13 @@ def invoke_vertex_ai_model_streaming(messages, enable_reasoning=False, image_byt
                         conversation_history.append({"role": role, "content": content})
             
             # Get the current prompt from the last user message
-            user_messages = [msg for msg in messages if msg.get('role') == 'user']
-            if user_messages:
+                    user_messages = [msg for msg in messages if msg.get('role') == 'user']
+                    if user_messages:
                 current_prompt = user_messages[-1].get('content', '')
-                # Check if image was passed
-                if 'image_bytes' in user_messages[-1]:
-                    print("Detected image in prompt - activating multimodal processing")
-        else:
+                        # Check if image was passed
+                        if 'image_bytes' in user_messages[-1]:
+                            print("Detected image in prompt - activating multimodal processing")
+                    else:
             current_prompt = str(messages)
         
         # Check for image_bytes param as well (for compatibility with different call formats)
@@ -519,13 +519,13 @@ def read_agent_response(event_stream):
     
     try:
         # Process the event stream and build the response
-        for chunk in event_stream:
+            for chunk in event_stream:
             if isinstance(chunk, dict) and "text" in chunk:
                 text = chunk["text"]
                 full_response += text
             elif hasattr(chunk, "text"):
-                full_response += chunk.text
-            else:
+                    full_response += chunk.text
+                else:
                 # Fallback for any other format
                 chunk_str = str(chunk)
                 if chunk_str and chunk_str.strip():
