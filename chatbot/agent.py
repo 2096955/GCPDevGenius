@@ -1,167 +1,272 @@
 import streamlit as st
 import os
-import boto3
-from botocore.config import Config
+from google.cloud import aiplatform, storage, firestore
+from google.oauth2 import service_account
 from PIL import Image
-from utils import invoke_bedrock_agent
-from utils import read_agent_response
-from utils import enable_artifacts_download
-from utils import retrieve_environment_variables
-from utils import save_conversation
-from utils import invoke_bedrock_model_streaming
+from utils import (
+    invoke_vertex_ai_model_streaming,
+    read_agent_response,
+    enable_artifacts_download,
+    retrieve_environment_variables,
+    save_conversation_gcp,
+    init_gcp_clients,
+)
 from layout import create_tabs, create_option_tabs, welcome_sidebar, login_page
 from styles import apply_styles
 from cost_estimate_widget import generate_cost_estimates
 from generate_arch_widget import generate_arch
-from generate_cdk_widget import generate_cdk
-from generate_cfn_widget import generate_cfn
+from generate_terraform_widget import generate_terraform
+from generate_dm_widget import generate_deployment_manager
 from generate_doc_widget import generate_doc
 import io
 
+# Import A2A client components - wrap in try-except to handle missing dependencies
+try:
+    from a2a.common import A2AClient, Message, TextPart
+    import asyncio
+    import uuid
+    A2A_AVAILABLE = True
+except ImportError:
+    print("A2A dependencies not available. Will use Vertex AI only.")
+    A2A_AVAILABLE = False
+    # Define dummy asyncio for non-A2A operation
+    import asyncio
+    import uuid
+
 # Streamlit configuration 
-st.set_page_config(page_title="DevGenius", layout='wide')
+st.set_page_config(page_title="DevGenius (GCP)", layout='wide')
 apply_styles()
 
-# Initialize AWS clients
-AWS_REGION = os.getenv("AWS_REGION")
-config = Config(read_timeout=1000, retries=dict(max_attempts=5))
-bedrock_client = boto3.client('bedrock-runtime', region_name=AWS_REGION, config=config)
-s3_client = boto3.client('s3', region_name=AWS_REGION)
-sts_client = boto3.client('sts', region_name=AWS_REGION)
-dynamodb_resource = boto3.resource('dynamodb', region_name=AWS_REGION)
+# GCP Project and Region
+GCP_PROJECT = retrieve_environment_variables("GOOGLE_CLOUD_PROJECT", "your-gcp-project-id")
+GCP_REGION = retrieve_environment_variables("GOOGLE_CLOUD_REGION", "us-central1")
 
-ACCOUNT_ID = sts_client.get_caller_identity()["Account"]
-# Constants
-BEDROCK_MODEL_ID = f"arn:aws:bedrock:{AWS_REGION}:{ACCOUNT_ID}:inference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0"  # noqa
-CONVERSATION_TABLE_NAME = retrieve_environment_variables("CONVERSATION_TABLE_NAME")
-FEEDBACK_TABLE_NAME = retrieve_environment_variables("FEEDBACK_TABLE_NAME")
-SESSION_TABLE_NAME = retrieve_environment_variables("SESSION_TABLE_NAME")
-S3_BUCKET_NAME = retrieve_environment_variables("S3_BUCKET_NAME")
-BEDROCK_AGENT_ID = retrieve_environment_variables("BEDROCK_AGENT_ID")
-BEDROCK_AGENT_ALIAS_ID = retrieve_environment_variables("BEDROCK_AGENT_ALIAS_ID")
+# Initialize GCP clients
+storage_client, firestore_client = init_gcp_clients()
 
+# A2A Host Agent configuration (default to localhost)
+HOST_AGENT_URL = retrieve_environment_variables("HOST_AGENT_URL", "http://localhost:8000")
+CODE_AGENT_URL = retrieve_environment_variables("CODE_AGENT_URL", "http://localhost:8001")
+DATA_AGENT_URL = retrieve_environment_variables("DATA_AGENT_URL", "http://localhost:8002")
+
+# Function to create A2A client
+def get_a2a_client(agent_url=HOST_AGENT_URL):
+    """Get an A2A client connected to the specified agent."""
+    if not A2A_AVAILABLE:
+        return None
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    return A2AClient(agent_url=agent_url, api_key=api_key)
+
+# Function to process request through A2A
+async def process_with_a2a(prompt, agent_url=HOST_AGENT_URL):
+    """Process a request through A2A and return the response."""
+    if not A2A_AVAILABLE:
+        return "A2A functionality is not available. Using Vertex AI instead."
+    
+    try:
+        # Create A2A client
+        client = get_a2a_client(agent_url)
+        
+        # Create session ID if not already present
+        if 'a2a_session_id' not in st.session_state:
+            st.session_state.a2a_session_id = str(uuid.uuid4())
+        
+        # Create message
+        message = Message(
+            role="user",
+            parts=[TextPart(text=prompt)]
+        )
+        
+        # Send task to agent
+        task = await client.send_task(
+            message=message,
+            session_id=st.session_state.a2a_session_id
+        )
+        
+        # Poll until task is done
+        while task.status.state not in ["completed", "failed", "canceled"]:
+            await asyncio.sleep(0.5)
+            task = await client.get_task(task.id)
+        
+        # Extract response
+        response_text = ""
+        if task.status.state == "completed":
+            if task.status.message:
+                for part in task.status.message.parts:
+                    if hasattr(part, "text"):
+                        response_text += part.text
+            
+            if task.artifacts:
+                for artifact in task.artifacts:
+                    for part in artifact.parts:
+                        if hasattr(part, "text"):
+                            if response_text:
+                                response_text += "\n\n"
+                            response_text += part.text
+        else:
+            response_text = f"Task {task.status.state}: {task.status.message if task.status.message else 'Unknown error'}"
+        
+        # Close client
+        await client.close()
+        
+        return response_text
+    except Exception as e:
+        return f"Error processing request with A2A: {str(e)}"
+
+# Function to determine if a prompt should be routed to A2A
+def should_route_to_a2a(prompt):
+    """Determine if a prompt should be routed to A2A based on content."""
+    # If A2A is not available, always return False
+    if not A2A_AVAILABLE:
+        return False
+        
+    prompt_lower = prompt.lower()
+    
+    # Keywords that indicate AWS to GCP migration tasks
+    aws_keywords = ["aws", "amazon", "ec2", "s3", "lambda", "dynamodb", "migrate", "migration", "convert"]
+    gcp_keywords = ["gcp", "google cloud", "gcs", "cloud function", "firestore", "spanner"]
+    code_keywords = ["code", "convert", "translation", "transform", "refactor"]
+    data_keywords = ["data", "schema", "database", "table", "storage", "bucket"]
+    
+    # Check if the prompt contains AWS and GCP keywords
+    has_aws = any(keyword in prompt_lower for keyword in aws_keywords)
+    has_gcp = any(keyword in prompt_lower for keyword in gcp_keywords)
+    has_code = any(keyword in prompt_lower for keyword in code_keywords)
+    has_data = any(keyword in prompt_lower for keyword in data_keywords)
+    
+    # Route to A2A if it mentions AWS and GCP, plus either code or data
+    return (has_aws and has_gcp) and (has_code or has_data)
+
+# Function to determine which specific agent to route to
+def get_agent_for_prompt(prompt):
+    """Determine which specialized agent to route to based on the prompt."""
+    prompt_lower = prompt.lower()
+    
+    # Keywords for code conversion
+    code_keywords = ["code", "convert", "function", "lambda", "ec2", "terraform", "cloudformation", "translate", "implementation"]
+    
+    # Keywords for data migration
+    data_keywords = ["data", "schema", "database", "dynamodb", "s3", "migration", "storage", "firestore", "spanner", "bigquery"]
+    
+    # Count matches for each category
+    code_matches = sum(1 for keyword in code_keywords if keyword in prompt_lower)
+    data_matches = sum(1 for keyword in data_keywords if keyword in prompt_lower)
+    
+    # Route based on which category has more matches
+    if code_matches > data_matches:
+        return CODE_AGENT_URL
+    elif data_matches > code_matches:
+        return DATA_AGENT_URL
+    else:
+        # Default to host agent if unclear
+        return HOST_AGENT_URL
 
 def display_image(image, width=600, caption="Uploaded Image", use_center=True):
     if use_center:
-        # Center the image using columns
         col1, col2, col3 = st.columns([1, 2, 1])
         display_container = col2
     else:
-        # Use full width container
         display_container = st
-
     with display_container:
         st.image(
             image,
             caption=caption,
             width=width,
             use_column_width=False,
-            clamp=True  # Prevents image from being larger than its original size
+            clamp=True
         )
 
-
-# Function to interact with the Bedrock model using an image and query
-def get_image_insights(image_data, query="Explain in detail the architecture flow"):
-    query = ('''Explain in detail the architecture flow.
-             If the given image is not related to technical architecture, then please request the user to upload an AWS architecture or hand drawn architecture.
-             When generating the solution , highlight the AWS service names in bold
-             ''')  # noqa
-    messages = [{
-        "role": "user",
-        "content": [
-            {"image": {"format": "png", "source": {"bytes": image_data}}},
-            {"text": query}
-        ]}
-    ]
+def get_image_insights_vertex(image_data, query="Explain in detail the architecture flow"):
+    # Example Vertex AI model invocation (pseudo-code, replace with your model details)
+    # You may need to adapt this to your Vertex AI model's API
     try:
-        streaming_response = bedrock_client.converse_stream(
-            modelId=BEDROCK_MODEL_ID,
-            messages=messages,
-            inferenceConfig={"maxTokens": 2000, "temperature": 0.1, "topP": 0.9}
+        response = invoke_vertex_ai_model_streaming(
+            messages=[{"role": "user", "content": query, "image_bytes": image_data}],
+            enable_reasoning=True
         )
-
-        full_response = ""
+        
+        # Create a styled placeholder for streaming output
         output_placeholder = st.empty()
-        for chunk in streaming_response["stream"]:
-            if "contentBlockDelta" in chunk:
-                text = chunk["contentBlockDelta"]["delta"]["text"]
+        full_response = ""
+        
+        # Process streaming chunks
+        for chunk in response:
+            if chunk and "text" in chunk:
+                text = chunk.get("text", "")
                 full_response += text
-                output_placeholder.markdown(f"<div class='wrapped-text'>{full_response}</div>", unsafe_allow_html=True)
-        output_placeholder.write("")
-
+                # Update the placeholder with the current content inside a styled div
+                output_placeholder.markdown(
+                    f"""<div style="background-color: white; color: black; padding: 10px; border-radius: 5px; border: 1px solid #e0e0e0;">
+                    {full_response}
+                    </div>""", 
+                    unsafe_allow_html=True
+                )
+        
+        # Clear the placeholder since we'll show the message in the chat history
+        output_placeholder.empty()
+        
+        # Add to message history
         if 'mod_messages' not in st.session_state:
             st.session_state.mod_messages = []
         st.session_state.mod_messages.append({"role": "assistant", "content": full_response})
         st.session_state.interaction.append({"type": "Architecture details", "details": full_response})
-        save_conversation(st.session_state['conversation_id'], prompt, full_response)
-
+        save_conversation_gcp(st.session_state['conversation_id'], query, full_response, firestore_client)
+        
+        return full_response
     except Exception as e:
-        st.error(f"ERROR: Can't invoke '{BEDROCK_MODEL_ID}'. Reason: {e}")
+        st.error(f"ERROR: Can't invoke Vertex AI model. Reason: {e}")
+        return f"Error analyzing image: {e}"
 
-
-# Reset the chat history in session state
 def reset_chat():
-    # Clear specific message-related session states
-    keys_to_keep = {'conversation_id', 'user_authenticated', 'user_name', 'user_email', 'cognito_authentication', 'token', 'midway_user'}  # noqa
+    keys_to_keep = {'conversation_id', 'user_authenticated', 'user_name', 'user_email', 'firebase_authentication', 'token', 'midway_user'}
     keys_to_remove = set(st.session_state.keys()) - keys_to_keep
-
     for key in keys_to_remove:
         del st.session_state[key]
-
     st.session_state.messages = []
 
-
-# Reset the chat history in session state
 def reset_messages():
-    # st.session_state['conversation_id'] = str(uuid.uuid4())
-
     initial_question = get_initial_question(st.session_state.topic_selector)
-    st.session_state.messages = [{"role": "assistant", "content": "Welcome to DevGenius — turning ideas into reality. Together, we’ll design your architecture and solution, with each conversation shaping your vision. Let’s get started on building!"}]
-
+    st.session_state.messages = [{"role": "assistant", "content": "Welcome to DevGenius (GCP) — turning ideas into reality. Together, we'll design your architecture and solution, with each conversation shaping your vision. Let's get started on building!"}]
     if initial_question:
         st.session_state.messages.append({"role": "user", "content": initial_question})
-        response = invoke_bedrock_agent(st.session_state.conversation_id, initial_question)
-        event_stream = response['completion']
+        response = invoke_vertex_ai_model_streaming(
+            [{"role": "user", "content": initial_question}]
+        )
+        event_stream = response
         ask_user, agent_answer = read_agent_response(event_stream)
         st.session_state.messages.append({"role": "assistant", "content": agent_answer})
 
-
-# Function to format assistant's response for markdown
 def format_for_markdown(response_text):
-    return response_text.replace("\n", "\n\n")  # Ensure proper line breaks for markdown rendering
-
+    return response_text.replace("\n", "\n\n")
 
 def get_initial_question(topic):
     return {
-        "Data Lake": "How can I build an enterprise data lake on AWS?",
-        "Log Analytics": "How can I build a log analytics solution on AWS?"
+        "Data Lake": "How can I build an enterprise data lake on GCP?",
+        "Log Analytics": "How can I build a log analytics solution on GCP?"
     }.get(topic, "")
 
-
-# Function to compress or resize image if it exceeds 5MB
 def resize_or_compress_image(uploaded_image):
-    # Open the image using PIL
     image = Image.open(uploaded_image)
-
-    # Check the size of the uploaded image
     image_bytes = uploaded_image.getvalue()
-    if len(image_bytes) > 5 * 1024 * 1024:  # 5MB in bytes
+    if len(image_bytes) > 5 * 1024 * 1024:
         st.write("Image size exceeds 5MB. Resizing...")
-
-        # Resize the image (you can adjust the dimensions as needed)
-        image = image.resize((800, 600))  # Example resize, you can adjust this
-
-        # Compress the image by saving it to a BytesIO object with reduced quality
+        image = image.resize((800, 600))
         img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format="JPEG", quality=85)  # Adjust quality if needed
+        image.save(img_byte_arr, format="JPEG", quality=85)
         img_byte_arr.seek(0)
-
-        # Return the compressed image
         return img_byte_arr
     else:
-        # If the image is under 5MB, no resizing is needed, just return the original
         return uploaded_image
 
+# Helper function to run async tasks within Streamlit
+def run_async(coroutine):
+    """Run an async coroutine and return the result."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coroutine)
+    finally:
+        loop.close()
 
 #########################################
 # Streamlit Main Execution Starts Here
@@ -178,209 +283,240 @@ else:
     if 'active_tab' not in st.session_state:
         st.session_state.active_tab = "Build a solution"
     with st.sidebar:
-        # st.title("DevGenius")
         welcome_sidebar()
-
-    # Tab for "Generate Architecture Diagram and Solution"
     with tabs[0]:
-        st.header("Generate Architecture Diagram and Solution")
-
+        st.markdown("""<h1 style="background-color: white; color: #4285F4; padding: 15px; border-radius: 8px; border: 1px solid #e0e0e0; text-align: center; margin-bottom: 20px;">
+        Generate Architecture Diagram and Solution (GCP)
+        </h1>""", unsafe_allow_html=True)
         if "topic_selector" not in st.session_state:
             st.session_state.topic_selector = ""
             reset_messages()
-
         if st.session_state.active_tab != "Build a solution":
-            print("inside tab1 active_tab:", st.session_state.active_tab)
             st.session_state.active_tab = "Build a solution"
-
-        # col1, col2, _, _, right = st.columns(5)
-        # with col1:
-        #     topic = st.selectbox("Select the feature to proceed", ["","Data Lake", "Log Analytics"], key="topic_selector", on_change=reset_messages)  # noqa
-        # with right:
-        #     st.button('Clear Chat History', on_click=reset_messages)
-
         if "messages" not in st.session_state:
             st.session_state["messages"] = [{"role": "assistant", "content": "Welcome"}]
-
-        # Display the conversation messages
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
-                st.write(message["content"])
-
-        prompt = st.chat_input(key='Generate')
-
+                st.markdown(f"""<div style="background-color: white; color: black; padding: 10px; border-radius: 5px; border: 1px solid #e0e0e0;">
+                {message["content"]}
+                </div>""", unsafe_allow_html=True)
+        
+        # Make the chat input more visible with custom styling
+        st.markdown("""
+        <style>
+        [data-testid="stChatInput"] {
+            background-color: white !important;
+            border: 2px solid #4285F4 !important;
+            border-radius: 8px !important;
+            padding: 10px !important;
+        }
+        [data-testid="stChatInput"] > input {
+            color: black !important;
+            background-color: white !important;
+        }
+        [data-testid="stChatInput"]::placeholder {
+            color: #666 !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        prompt = st.chat_input("Type your message here...", key='Generate')
         if prompt:
-
-            # when the user refines the solution , reset checkbox of all tabs
-            # and force user to re-check to generate updated solution
             st.session_state.cost = False
             st.session_state.arch = False
-            st.session_state.cdk = False
-            st.session_state.cfn = False
-            st.session_state.doc = False
-
-            st.chat_message("user").markdown(prompt)
+            st.session_state.terraform = False
+            with st.chat_message("user"):
+                st.markdown(f"""<div style="background-color: white; color: black; padding: 10px; border-radius: 5px; border: 1px solid #e0e0e0;">
+                {prompt}
+                </div>""", unsafe_allow_html=True)
             st.session_state.messages.append({"role": "user", "content": prompt})
-
+            
             with st.chat_message("assistant"):
+                # Create a placeholder for streaming response
+                message_placeholder = st.empty()
+                streaming_content = ""
+                
                 with st.spinner("Thinking..."):
-                    response = invoke_bedrock_agent(st.session_state.conversation_id, prompt)
-                    event_stream = response['completion']
-                    ask_user, agent_answer = read_agent_response(event_stream)
-                    st.markdown(agent_answer)
-
-            st.session_state.messages.append({"role": "assistant", "content": agent_answer})
-
-            # Check if we have reached the number of questions
+                    # Check if we should route to A2A
+                    if should_route_to_a2a(prompt):
+                        # Get the appropriate agent URL
+                        agent_url = get_agent_for_prompt(prompt)
+                        
+                        # Process with A2A
+                        agent_answer = run_async(process_with_a2a(prompt, agent_url))
+                        
+                        # Add a tag to indicate this was processed by A2A
+                        if A2A_AVAILABLE:
+                            agent_source = "Code Conversion Agent" if agent_url == CODE_AGENT_URL else "Data Migration Agent" if agent_url == DATA_AGENT_URL else "Host Agent"
+                            agent_answer = f"**[Processed by {agent_source}]**\n\n{agent_answer}"
+                            
+                        # Display the final response in the placeholder
+                        message_placeholder.markdown(f"""<div style="background-color: white; color: black; padding: 10px; border-radius: 5px; border: 1px solid #e0e0e0;">
+                        {agent_answer}
+                        </div>""", unsafe_allow_html=True)
+                    else:
+                        # Use existing Vertex AI processing with streaming
+                        response = invoke_vertex_ai_model_streaming(
+                            st.session_state.mod_messages + [{"role": "user", "content": prompt}]
+                        )
+                        
+                        # Process the streaming response chunks
+                        streaming_content = ""
+                        for chunk in response:
+                            if chunk and "text" in chunk:
+                                streaming_content += chunk["text"]
+                                # Update the placeholder with the current streamed content
+                                message_placeholder.markdown(f"""<div style="background-color: white; color: black; padding: 10px; border-radius: 5px; border: 1px solid #e0e0e0;">
+                                {streaming_content}
+                                </div>""", unsafe_allow_html=True)
+                        
+                        # Get the final formatted response
+                        ask_user, agent_answer = streaming_content, streaming_content
+                    
+                # Save the complete response to session state
+                st.session_state.messages.append({"role": "assistant", "content": agent_answer})
+                
             if not ask_user:
                 st.session_state.interaction.append(
                     {"type": "Details", "details": st.session_state.messages[-1]['content']})
-                devgenius_option_tabs = create_option_tabs()
-                with devgenius_option_tabs[0]:
-                    generate_cost_estimates(st.session_state.messages)
-                with devgenius_option_tabs[1]:
-                    generate_arch(st.session_state.messages)
-                with devgenius_option_tabs[2]:
-                    generate_cdk(st.session_state.messages)
-                with devgenius_option_tabs[3]:
-                    generate_cfn(st.session_state.messages)
-                with devgenius_option_tabs[4]:
-                    generate_doc(st.session_state.messages)
                 enable_artifacts_download()
-
-            save_conversation(st.session_state['conversation_id'], prompt, agent_answer)
-
-    # Tab for "Generate Solution from Existing Architecture"
+            save_conversation_gcp(st.session_state['conversation_id'], prompt, agent_answer, firestore_client)
     with tabs[1]:
-        st.header("Generate Solution from Existing Architecture")
-
-        # Custom CSS to style the file uploader button
+        st.header("Generate Solution from Existing Architecture (GCP)")
         st.markdown("""
             <style>
-            /* Target the file uploader button */
             .stFileUploader button {
-                background-color: #4CAF50; /* Green background for the button */
-                color: white !important; /* White text color */
-                border: none !important; /* Remove default border */
-                padding: 10px 20px; /* Add padding */
-                border-radius: 5px; /* Rounded corners */
-                font-size: 16px; /* Font size */
-                cursor: pointer; /* Pointer cursor on hover */
+                background-color: #4285F4;
+                color: white !important;
+                border: none !important;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-size: 16px;
+                cursor: pointer;
             }
-
-            /* Add hover effect to make the button look more interactive */
             .stFileUploader button:hover {
-                background-color: #45a049; /* Darker green when hovered */
+                background-color: #3367D6;
             }
             </style>
         """, unsafe_allow_html=True)
-
-        # File uploader and image insights logic
         uploaded_file = st.file_uploader("Choose an image...", type=["png", "jpg", "jpeg"], on_change=reset_chat)
         if st.session_state.active_tab != "Modify your existing architecture":
-            print("inside tab2 active_tab:", st.session_state.active_tab)
-            # reset_chat()
             st.session_state.active_tab = "Modify your existing architecture"
-
         if uploaded_file:
-            # write the upload file to S3 bucket
-            s3_key = f"{st.session_state.conversation_id}/uploaded_file/{uploaded_file.name}"  # noqa
-            # response = s3_client.put_object(Body=uploaded_file.getvalue(), Bucket=S3_BUCKET_NAME, Key=s3_key)
-            # print(response)
-            # st.session_state.uploaded_image = uploaded_file
+            gcs_bucket_name = retrieve_environment_variables("GCS_BUCKET_NAME")
+            bucket = storage_client.bucket(gcs_bucket_name)
+            blob = bucket.blob(f"{st.session_state.conversation_id}/uploaded_file/{uploaded_file.name}")
             resized_image = resize_or_compress_image(uploaded_file)
-            response = s3_client.put_object(Body=resized_image, Bucket=S3_BUCKET_NAME, Key=s3_key)
+            blob.upload_from_file(resized_image)
             st.session_state.uploaded_image = resized_image
             image = Image.open(st.session_state.uploaded_image)
             display_image(image)
             image_bytes = st.session_state.uploaded_image.getvalue()
-
             if 'image_insights' not in st.session_state:
-                st.session_state.image_insights = get_image_insights(
+                st.session_state.image_insights = get_image_insights_vertex(
                     image_data=image_bytes)
-
         if 'mod_messages' not in st.session_state:
             st.session_state.mod_messages = []
-
         if 'generate_arch_called' not in st.session_state:
             st.session_state.generate_arch_called = False
-
         if 'generate_cost_estimates_called' not in st.session_state:
             st.session_state.generate_cost_estimates_called = False
-
-        if 'generate_cdk_called' not in st.session_state:
-            st.session_state.generate_cdk_called = False
-
-        if 'generate_cfn_called' not in st.session_state:
-            st.session_state.generate_cfn_called = False
-
-        if 'generate_doc_called' not in st.session_state:
-            st.session_state.generate_doc_called = False
-
-        # Display chat history
+        if 'generate_terraform_called' not in st.session_state:
+            st.session_state.generate_terraform_called = False
         for msg in st.session_state.mod_messages:
             if msg["role"] == "user":
-                st.chat_message("user").markdown(msg["content"])
+                with st.chat_message("user"):
+                    st.markdown(f"""<div style="background-color: white; color: black; padding: 10px; border-radius: 5px; border: 1px solid #e0e0e0;">
+                    {msg["content"]}
+                    </div>""", unsafe_allow_html=True)
             elif msg["role"] == "assistant":
-                # Format the assistant's response for markdown (ensure proper rendering)
                 formatted_content = format_for_markdown(msg["content"])
-                st.chat_message("assistant").markdown(formatted_content)
-
-        # Trigger actions for generating solution
+                with st.chat_message("assistant"):
+                    st.markdown(f"""<div style="background-color: white; color: black; padding: 10px; border-radius: 5px; border: 1px solid #e0e0e0;">
+                    {formatted_content}
+                    </div>""", unsafe_allow_html=True)
         if uploaded_file:
-            devgenius_option_tabs = create_option_tabs()
-            with devgenius_option_tabs[0]:
-                if not st.session_state.generate_cost_estimates_called:
-                    generate_cost_estimates(st.session_state.mod_messages)
-                    st.session_state.generate_cost_estimates_called = True
-            with devgenius_option_tabs[1]:
-                if not st.session_state.generate_arch_called:
-                    generate_arch(st.session_state.mod_messages)
-                    st.session_state.generate_arch_called = True
-
-            with devgenius_option_tabs[2]:
-                if not st.session_state.generate_cdk_called:
-                    generate_cdk(st.session_state.mod_messages)
-                    st.session_state.generate_cdk_called = True
-
-            with devgenius_option_tabs[3]:
-                if not st.session_state.generate_cfn_called:
-                    generate_cfn(st.session_state.mod_messages)
-                    st.session_state.generate_cfn_called = True
-
-            with devgenius_option_tabs[4]:
-                if not st.session_state.generate_doc_called:
-                    generate_doc(st.session_state.mod_messages)
-                    st.session_state.generate_doc_called = True
-
             if st.session_state.interaction:
                 enable_artifacts_download()
 
-        # Handle new chat input
-        if prompt := st.chat_input():
+        # Add the same chat input styling here for consistency
+        st.markdown("""
+        <style>
+        [data-testid="stChatInput"] {
+            background-color: white !important;
+            border: 2px solid #4285F4 !important;
+            border-radius: 8px !important;
+            padding: 10px !important;
+        }
+        [data-testid="stChatInput"] > input {
+            color: black !important;
+            background-color: white !important;
+        }
+        [data-testid="stChatInput"]::placeholder {
+            color: #666 !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        if prompt := st.chat_input("Describe your architecture or ask a question...", key="Architecture"):
             st.session_state.generate_arch_called = False
-            st.session_state.generate_cdk_called = False
-            st.session_state.generate_cfn_called = False
+            st.session_state.generate_terraform_called = False
             st.session_state.generate_cost_estimates_called = False
-            st.session_state.generate_doc_called = False
-
-            # when the user refines the solution , reset checkbox of all tabs
-            # and force user to re-check to generate updated solution
-            st.session_state.cost = False
-            st.session_state.arch = False
-            st.session_state.cdk = False
-            st.session_state.cfn = False
-            st.session_state.doc = False
-
             st.session_state.mod_messages.append({"role": "user", "content": prompt})
             st.chat_message("user").markdown(prompt)
-
+            
             with st.chat_message("assistant"):
+                # Create a placeholder for streaming response
+                message_placeholder = st.empty()
+                streaming_content = ""
+                
                 with st.spinner("Thinking..."):
-                    response = invoke_bedrock_model_streaming(st.session_state.mod_messages)
-                    st.session_state.interaction.append({"type": "Architecture details", "details": response})
-                    st.markdown(f"<div class='wrapped-text'>{response}</div>", unsafe_allow_html=True)
-
-            st.session_state.mod_messages.append({"role": "assistant", "content": response[0]})
-            save_conversation(st.session_state['conversation_id'], prompt, response[0])
+                    # Check if we should route to A2A (even for image descriptions)
+                    if should_route_to_a2a(prompt):
+                        # Get the appropriate agent URL
+                        agent_url = get_agent_for_prompt(prompt)
+                        
+                        # Process with A2A, including image context if needed
+                        if 'uploaded_image' in st.session_state:
+                            # For A2A, we could add a text note about the image
+                            prompt_with_context = f"{prompt}\n\n[Note: This query is related to an uploaded architecture image that shows AWS resources]"
+                            response = run_async(process_with_a2a(prompt_with_context, agent_url))
+                        else:
+                            response = run_async(process_with_a2a(prompt, agent_url))
+                        
+                        # Add a tag to indicate this was processed by A2A
+                        if A2A_AVAILABLE:
+                            agent_source = "Code Conversion Agent" if agent_url == CODE_AGENT_URL else "Data Migration Agent" if agent_url == DATA_AGENT_URL else "Host Agent"
+                            response = f"**[Processed by {agent_source}]**\n\n{response}"
+                            
+                        # Display the final response in the placeholder
+                        message_placeholder.markdown(f"""<div style="background-color: white; color: black; padding: 10px; border-radius: 5px; border: 1px solid #e0e0e0;">
+                        {response}
+                        </div>""", unsafe_allow_html=True)
+                        
+                        # Save for interaction history
+                        agent_answer = response
+                    else:
+                        # Use existing Vertex AI processing with streaming
+                        response = invoke_vertex_ai_model_streaming(
+                            st.session_state.mod_messages + [{"role": "user", "content": prompt}]
+                        )
+                        
+                        # Process the streaming response chunks
+                        streaming_content = ""
+                        for chunk in response:
+                            if chunk and "text" in chunk:
+                                streaming_content += chunk["text"]
+                                # Update the placeholder with the current streamed content
+                                message_placeholder.markdown(f"""<div style="background-color: white; color: black; padding: 10px; border-radius: 5px; border: 1px solid #e0e0e0;">
+                                {streaming_content}
+                                </div>""", unsafe_allow_html=True)
+                        
+                        # Save the final content
+                        agent_answer = streaming_content
+                    
+                    st.session_state.interaction.append({"type": "Architecture details", "details": agent_answer})
+                    
+            st.session_state.mod_messages.append({"role": "assistant", "content": agent_answer})
+            save_conversation_gcp(st.session_state['conversation_id'], prompt, agent_answer, firestore_client)
             st.rerun()

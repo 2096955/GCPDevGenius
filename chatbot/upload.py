@@ -1,22 +1,18 @@
 import streamlit as st
-import boto3
+from google.cloud import storage, firestore
+from google.oauth2 import service_account
 import os
+import uuid
 from pypdf import PdfWriter, PdfReader
 import io
 import tempfile
-from botocore.config import Config
 # Import necessary modules
 from langchain.document_loaders import UnstructuredPowerPointLoader
 
-# NORTHSTAR_S3_BUCKET_NAME = os.environ.get('NORTHSTAR_S3_BUCKET_NAME')
-NORTHSTAR_S3_BUCKET_NAME = "devgenius-reinvent-release-037225164867-us-west-2"
-AWS_REGION = os.getenv("AWS_REGION")
-config = Config(read_timeout=1000, retries=(dict(max_attempts=5)))
-
-bedrock_agent_runtime_client = boto3.client('bedrock-agent-runtime', region_name=AWS_REGION)
-bedrock_client = boto3.client('bedrock-runtime', region_name=AWS_REGION, config=config)
-s3_client = boto3.client('s3', region_name=AWS_REGION, config=config)
-s3_resource = boto3.resource('s3', region_name=AWS_REGION)
+# GCP environment variables
+GCP_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT") or "gbg-neuro"
+GCP_REGION = os.getenv("GOOGLE_CLOUD_REGION") or "us-central1"
+GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME") or "devgenius-files"
 
 import re
 
@@ -100,71 +96,64 @@ def split_pdf(pdf_content):
     return part1_bytes.getvalue(), part2_bytes.getvalue()
 
 
-def upload_to_s3(file_content, filename, bucket_name):
+def upload_to_gcs(file_content, filename, bucket_name, storage_client):
     try:
-        s3_client.put_object(
-            Bucket=bucket_name,
-            Key=filename,
-            Body=file_content
-        )
-        return True
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(filename)
+        
+        # If file_content is bytes, upload from string
+        if isinstance(file_content, bytes):
+            blob.upload_from_string(file_content)
+        else:
+            # Create a temporary file and upload from it
+            with tempfile.NamedTemporaryFile(delete=False) as temp:
+                temp.write(file_content)
+                temp_path = temp.name
+            
+            blob.upload_from_filename(temp_path)
+            os.unlink(temp_path)  # Delete the temporary file
+            
+        return True, blob.public_url
     except Exception as e:
-        st.error(f"Error uploading to S3: {str(e)}")
-        return False
+        st.error(f"Error uploading to GCS: {str(e)}")
+        return False, None
 
 
-def upload_file():
-    with st.sidebar:
-        # File uploader
-        uploaded_file = st.file_uploader(
-            "Upload a file",
-            type=['pdf', 'doc','docx','xls', 'xlsx','csv','txt']
+def upload_file_to_gcs(uploaded_file, bucket_name, storage_client):
+    blob_name = f"uploads/{uuid.uuid4()}_{uploaded_file.name}"
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_file(uploaded_file)
+    return blob.public_url
+
+def save_upload_metadata_gcp(file_url, user_id, firestore_client):
+    doc_ref = firestore_client.collection("uploads").document()
+    doc_ref.set({
+        "file_url": file_url,
+        "user_id": user_id,
+        "timestamp": firestore.SERVER_TIMESTAMP,
+    })
+
+# Initialize GCP clients
+def get_gcp_credentials():
+    credentials = None
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        credentials = service_account.Credentials.from_service_account_file(
+            os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         )
+    return credentials
 
-        if uploaded_file is not None:
-            file_content = uploaded_file.read()
-            file_size = len(file_content)
-            file_extension = uploaded_file.name.split('.')[-1].lower()
-            print("file_extension:",file_extension)
-            print("uploaded_file.name:",uploaded_file.name)
+# Initialize GCP clients
+credentials = get_gcp_credentials()
+storage_client = storage.Client(project=GCP_PROJECT, credentials=credentials)
+firestore_client = firestore.Client(project=GCP_PROJECT, credentials=credentials)
 
-            # Save the uploaded file to a temporary location
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
-                tmp_file.flush()  # Ensure all data is written to disk
-                file_path = tmp_file.name
-
-            # Handle large files (> 45MB)
-            if file_extension == 'pdf':
-                if file_size > 45 * 1024 * 1024:  # 45MB in bytes
-                    st.info("File is larger than 45MB. Splitting into two parts...")
-                    part1, part2 = split_pdf(file_content)
-                    # Upload both parts
-                    filename_base = uploaded_file.name.rsplit('.', 1)[0]
-                    success1 = upload_to_s3(part1, f"{filename_base}_part1.pdf", NORTHSTAR_S3_BUCKET_NAME)
-                    success2 = upload_to_s3(part2, f"{filename_base}_part2.pdf", NORTHSTAR_S3_BUCKET_NAME)
-
-                    if success1 and success2:
-                        st.success("Both parts uploaded successfully!")
-                else:
-                    # Upload normal file
-                    if upload_to_s3(file_content, uploaded_file.name, NORTHSTAR_S3_BUCKET_NAME):
-                        st.success("File uploaded successfully!")
-            # Handle PPT/PPTX conversion
-            elif file_extension in ['ppt', 'pptx']:
-                st.info("Converting PowerPoint to txt...")
-                ppt_extract = PPTExtraction(file_path)
-                updated_file_content = ppt_extract.extract()
-                # file_content = convert_ppt_to_pdf(file_content)
-                uploaded_file.name = uploaded_file.name.rsplit('.', 1)[0] + '.txt'
-                # Upload normal file
-                if upload_to_s3(updated_file_content, uploaded_file.name, NORTHSTAR_S3_BUCKET_NAME):
-                    st.success("File uploaded successfully!")
-            else: # docx, txt, xlsx,csv
-                if file_size > 45 * 1024 * 1024:  # 45MB in bytes
-                    st.error("Files larger than 45MB that are not PDFs cannot be split automatically.")
-                else:
-                # Upload normal file
-                    if upload_to_s3(file_content, uploaded_file.name, NORTHSTAR_S3_BUCKET_NAME):
-                        st.success("File uploaded successfully!")
+# Streamlit file uploader UI
+def file_upload_widget(user_id):
+    st.markdown("## Upload a file to Google Cloud Storage")
+    uploaded_file = st.file_uploader("Choose a file", type=None)
+    if uploaded_file is not None:
+        file_url = upload_file_to_gcs(uploaded_file, GCS_BUCKET_NAME, storage_client)
+        save_upload_metadata_gcp(file_url, user_id, firestore_client)
+        st.success(f"File uploaded successfully! [View file]({file_url})")
 

@@ -115,6 +115,69 @@ def apply_styles():
             padding: 8px 16px; /* Adjust padding for mobile */
         }
     }
+    .stButton button {
+        background-color: #4285F4; /* GCP blue */
+        color: white;
+        font-size: 18px;
+        padding: 16px 40px;
+        border-radius: 8px;
+        width: auto;
+        text-align: center;
+        white-space: nowrap;
+        font-weight: bold;
+        display: inline-block;
+    }
+    .gen-style {
+        margin-top: 10px;
+        margin-bottom: 10px;
+    }
+    .stSidebar {
+        background-color: #f5f5f5;
+    }
+    /* CHAT ELEMENTS - Ensure high contrast and visibility */
+    [data-testid="stChatMessage"] {
+        background-color: white !important;
+        border: 1px solid #e0e0e0 !important;
+        border-radius: 8px !important;
+        margin-bottom: 10px !important;
+        overflow: visible !important;
+    }
+    /* Style the chat message content */
+    [data-testid="stChatMessageContent"] {
+        background-color: white !important;
+        color: black !important;
+        padding: 15px !important;
+        border-radius: 5px !important;
+        font-size: 16px !important;
+    }
+    /* User messages */
+    [data-testid="stChatMessage"][data-testid*="user"] {
+        background-color: #f0f8ff !important; /* Light blue for user */
+        border-color: #b3d9ff !important;
+    }
+    /* Assistant messages */
+    [data-testid="stChatMessage"][data-testid*="assistant"] {
+        background-color: #f9f9f9 !important; /* Light gray for assistant */
+        border-color: #d9d9d9 !important;
+    }
+    /* Force text color to be black for all text in chat */
+    [data-testid="stChatMessage"] p, 
+    [data-testid="stChatMessage"] span, 
+    [data-testid="stChatMessage"] div,
+    [data-testid="stChatMessage"] code,
+    [data-testid="stChatMessage"] pre {
+        color: black !important;
+        background-color: transparent !important;
+    }
+    /* Ensure chat input has visible text */
+    .stChatInput input {
+        color: black !important;
+        background-color: white !important;
+        border: 2px solid #4285F4 !important;
+        padding: 12px !important;
+        border-radius: 8px !important;
+        font-size: 16px !important;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -124,14 +187,21 @@ def apply_custom_styles():
     st.markdown("""
     <style>
         /* Style the button (optional) */
-        .stButton.gen-style > button {
-            background-color: #0073e6;
-            color: black;
-            border: 2px solid #0073e6;
-            border-radius: 8px;
-            padding: 10px 20px;
-            font-size: 2px;
-            cursor: pointer;
+        .stButton button {
+            background-color: #34A853; /* GCP green */
+            color: white;
+            font-size: 16px;
+            padding: 12px 32px;
+            border-radius: 6px;
+            width: auto;
+            text-align: center;
+            white-space: nowrap;
+            font-weight: bold;
+            display: inline-block;
+        }
+        .gen-style {
+            margin-top: 8px;
+            margin-bottom: 8px;
         }
     </style>
     """, unsafe_allow_html=True)
