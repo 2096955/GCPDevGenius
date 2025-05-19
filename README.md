@@ -1,6 +1,6 @@
 # DevGenius GCP Solution Builder
 
-A smart, AI-powered solution architect that helps design, document, and generate infrastructure-as-code on GCP. This was inspired by https://github.com/aws-samples/sample-devgenius-aws-solution-builder (Due credit to Prasanna Sridhara of AWS for the inspiration)
+A smart, AI-powered solution architect that helps design, document, and generate infrastructure-as-code on GCP. This was inspired by https://github.com/aws-samples/sample-devgenius-aws-solution-builder (Due credit to Prasanna Sridharan of AWS for the inspiration)
 
 ## Features
 
