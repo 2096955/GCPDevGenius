@@ -23,7 +23,7 @@ A smart, AI-powered solution architect that helps design, document, and generate
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/sample-devgenius-aws-solution-builder.git
+git clone https://github.com/2096955/GCPDevGenius.git
 cd sample-devgenius-aws-solution-builder
 ```
 
